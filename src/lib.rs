@@ -98,7 +98,6 @@ pub struct Build {
     flags: Vec<String>,
     flags_supported: Vec<String>,
     files: Vec<PathBuf>,
-    dialect: Dialect,
     cpp: bool,
     cpp_link_stdlib: Option<Option<String>>,
     cpp_set_stdlib: Option<String>,
@@ -257,52 +256,19 @@ impl ToolFamily {
     }
 }
 
-/// Represents different C-like dialects.
-///
-/// Each dialect may require different compilers and compiler invocations.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Dialect {
-    /// Language dialect is C.
-    C,
-    /// Language dialect is C++.
-    Cpp,
-    /// Language dialect is CUDA C++ (currently a superset of C++11).
-    Cuda,
-}
-
-/// Detect the language dialect based on source file extension.
-pub fn autodetect_ext(src: &Path) -> Dialect {
-    if let Some(ext) = src.extension().and_then(|e| e.to_str()) {
-        match ext {
-            "c"     => Dialect::C,
-            "cc"    |
-            "cpp"   |
-            "cxx"   => Dialect::Cpp,
-            "cu"    => Dialect::Cuda,
-            _       => panic!("unknown source extension: {:?}", src),
-        }
-    } else {
-        panic!("source is missing an extension: {:?}", src);
-    }
-}
-
 /// Represents an object.
 ///
-/// This is a source file -> object file pair, with an associated language
-/// dialect.
+/// This is a source file -> object file pair.
 #[derive(Clone, Debug)]
 pub struct Object {
-    dialect: Dialect,
     src: PathBuf,
     dst: PathBuf,
 }
 
 impl Object {
-    /// Create a new source file -> object file pair, while autodetecting the
-    /// dialect from the source file extension.
+    /// Create a new source file -> object file pair.
     pub fn new(src: PathBuf, dst: PathBuf) -> Object {
         Object {
-            dialect: autodetect_ext(&src),
             src: src,
             dst: dst,
         }
@@ -325,7 +291,6 @@ impl Build {
             files: Vec::new(),
             shared_flag: None,
             static_flag: None,
-            dialect: Dialect::C,
             cpp: false,
             cpp_link_stdlib: None,
             cpp_set_stdlib: None,
@@ -436,7 +401,7 @@ impl Build {
             .opt_level(0)
             .host(&target)
             .debug(false)
-            .cpp(self.cpp);
+            .cpp(self.cpp)
             .cuda(self.cuda);
         let compiler = cfg.try_get_compiler()?;
         let mut cmd = compiler.to_command();
@@ -511,13 +476,6 @@ impl Build {
     /// Add a file which will be compiled
     pub fn file<P: AsRef<Path>>(&mut self, p: P) -> &mut Build {
         self.files.push(p.as_ref().to_path_buf());
-        match (self.dialect, autodetect_ext(p.as_ref())) {
-            (_,             Dialect::C)     => {}
-            (Dialect::C,    Dialect::Cpp)   |
-            (Dialect::Cpp,  Dialect::Cpp)   => { self.cpp(true); }
-            (Dialect::Cuda, Dialect::Cpp)   => {}
-            (_,             Dialect::Cuda)  => { self.cuda(true); }
-        }
         self
     }
 
@@ -539,9 +497,6 @@ impl Build {
     /// `true`.
     pub fn cpp(&mut self, cpp: bool) -> &mut Build {
         self.cpp = cpp;
-        if cpp {
-            self.dialect = Dialect::Cpp;
-        }
         self
     }
 
@@ -556,7 +511,6 @@ impl Build {
     pub fn cuda(&mut self, cuda: bool) -> &mut Build {
         self.cuda = cuda;
         if cuda {
-            self.dialect = Dialect::Cuda;
             self.cpp = true;
         }
         self
@@ -1066,11 +1020,6 @@ impl Build {
         let target = self.get_target()?;
 
         let mut cmd = self.get_base_compiler()?;
-        let nvcc = cmd.path
-            .file_name()
-            .and_then(|p| p.to_str())
-            .map(|p| p.contains("nvcc"))
-            .unwrap_or(false);
 
         // Non-target flags
         // If the flag is not conditioned on target variable, it belongs here :)
@@ -1113,13 +1062,10 @@ impl Build {
                     cmd.args.push(format!("-O{}", opt_level).into());
                 }
 
-                cmd.nvcc_wrap_arg(self.cuda);
-                cmd.args.push("-ffunction-sections".into());
-                cmd.nvcc_wrap_arg(self.cuda);
-                cmd.args.push("-fdata-sections".into());
+                cmd.push_cc_arg("-ffunction-sections".into(), self.cuda);
+                cmd.push_cc_arg("-fdata-sections".into(), self.cuda);
                 if self.pic.unwrap_or(!target.contains("windows-gnu")) {
-                    cmd.nvcc_wrap_arg(self.cuda);
-                    cmd.args.push("-fPIC".into());
+                    cmd.push_cc_arg("-fPIC".into(), self.cuda);
                 }
             }
         }
@@ -1129,11 +1075,11 @@ impl Build {
 
         if self.get_debug() {
             if self.cuda {
-                let nvcc_debug_arg = cmd.family.nvcc_debug_flag().into();
-                cmd.args.push(nvcc_debug_arg);
+                let nvcc_debug_flag = cmd.family.nvcc_debug_flag().into();
+                cmd.args.push(nvcc_debug_flag);
             }
-            cmd.nvcc_wrap_arg(self.cuda);
-            cmd.args.push(cmd.family.debug_flag().into());
+            let debug_flag = cmd.family.debug_flag().into();
+            cmd.push_cc_arg(debug_flag, self.cuda);
         }
 
         // Target flags
@@ -1248,8 +1194,7 @@ impl Build {
                 (None, _) => {}
                 (Some(stdlib), ToolFamily::Gnu) |
                 (Some(stdlib), ToolFamily::Clang) => {
-                    cmd.nvcc_wrap_arg(self.cuda);
-                    cmd.args.push(format!("-stdlib=lib{}", stdlib).into());
+                    cmd.push_cc_arg(format!("-stdlib=lib{}", stdlib).into(), self.cuda);
                 }
                 _ => {
                     println!(
@@ -1268,7 +1213,7 @@ impl Build {
 
         if self.warnings {
             for flag in cmd.family.warnings_flags().iter() {
-                cmd.args.push(flag.into());
+                cmd.push_cc_arg(flag.into(), self.cuda);
             }
         }
 
@@ -1278,8 +1223,7 @@ impl Build {
 
         for flag in self.flags_supported.iter() {
             if self.is_flag_supported(flag).unwrap_or(false) {
-                cmd.nvcc_wrap_arg(self.cuda);
-                cmd.args.push(flag.into());
+                cmd.push_cc_arg(flag.into(), self.cuda);
             }
         }
 
@@ -1296,16 +1240,9 @@ impl Build {
             }
         }
 
-        if self.warnings {
-            for flag in cmd.family.warnings_flags().iter() {
-                cmd.nvcc_wrap_arg(self.cuda);
-                cmd.args.push(flag.into());
-            }
-        }
-
         if self.warnings_into_errors {
-            cmd.nvcc_wrap_arg(self.cuda);
-            cmd.args.push(cmd.family.warnings_to_errors_flag().into());
+            let warnings_to_errors_flag = cmd.family.warnings_to_errors_flag().into();
+            cmd.push_cc_arg(warnings_to_errors_flag, self.cuda);
         }
 
         Ok(cmd)
@@ -1789,15 +1726,16 @@ impl Tool {
         }
     }
 
-    /// Optionally appends the NVCC wrapper flag "-Xcompiler".
+    /// Add a flag, and optionally prepend the NVCC wrapper flag "-Xcompiler".
     ///
     /// Currently this is only used for compiling CUDA sources, since NVCC only
     /// accepts a limited set of GNU-like flags, and the rest must be prefixed
     /// with a "-Xcompiler" flag to get passed to the underlying C++ compiler.
-    fn nvcc_wrap_arg(&mut self, cuda: bool) {
+    pub fn push_cc_arg(&mut self, flag: OsString, cuda: bool) {
         if cuda {
             self.args.push(self.family.nvcc_redirect_flag().into());
         }
+        self.args.push(flag);
     }
 
     /// Converts this compiler into a `Command` that's ready to be run.
