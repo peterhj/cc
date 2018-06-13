@@ -94,7 +94,9 @@ pub mod windows_registry;
 pub struct Build {
     include_directories: Vec<PathBuf>,
     definitions: Vec<(String, Option<String>)>,
-    objects: Vec<PathBuf>,
+    //objects: Vec<PathBuf>,
+    objects: Vec<Object>,
+    //custom_objects: Vec<Object>,
     explicit_flags: bool,
     flags: Vec<String>,
     flags_supported: Vec<String>,
@@ -264,7 +266,8 @@ impl ToolFamily {
 /// This is a source file -> object file pair.
 #[derive(Clone, Debug)]
 struct Object {
-    src: PathBuf,
+    compile_cmd: Option<Vec<String>>,
+    src: Option<PathBuf>,
     dst: PathBuf,
 }
 
@@ -272,8 +275,34 @@ impl Object {
     /// Create a new source file -> object file pair.
     fn new(src: PathBuf, dst: PathBuf) -> Object {
         Object {
-            src: src,
+            compile_cmd: None,
+            src: Some(src),
             dst: dst,
+        }
+    }
+
+    /// TODO
+    fn new_object_only(dst: PathBuf) -> Object {
+        Object {
+            compile_cmd: None,
+            src: None,
+            dst: dst,
+        }
+    }
+
+    /// TODO
+    fn new_custom_object(compile_cmd: Vec<String>, src: PathBuf, dst: PathBuf) -> Object {
+        Object {
+            compile_cmd: Some(compile_cmd),
+            src: Some(src),
+            dst: dst,
+        }
+    }
+
+    fn source(&self) -> &Path {
+        match self.src.as_ref() {
+            Some(p) => p,
+            None => panic!("object {:?} is missing a source path", self.dst),
         }
     }
 }
@@ -357,7 +386,16 @@ impl Build {
 
     /// Add an arbitrary object file to link in
     pub fn object<P: AsRef<Path>>(&mut self, obj: P) -> &mut Build {
-        self.objects.push(obj.as_ref().to_path_buf());
+        self.objects.push(Object::new_object_only(obj.as_ref().to_path_buf()));
+        self
+    }
+
+    /// TODO
+    pub fn custom_object<'a, P: AsRef<Path>, V: Into<Option<&'a str>>>(&mut self, obj: P, src: P, compile_cmd: Vec<V>) -> &mut Build {
+        let compile_cmd: Vec<String> = compile_cmd.into_iter()
+            .filter_map(|s| s.into().map(|s| s.to_string()))
+            .collect();
+        // TODO
         self
     }
 
@@ -934,7 +972,7 @@ impl Build {
     }
 
     fn compile_object(&self, obj: &Object) -> Result<(), Error> {
-        let is_asm = obj.src.extension().and_then(|s| s.to_str()) == Some("asm");
+        let is_asm = obj.source().extension().and_then(|s| s.to_str()) == Some("asm");
         let target = self.get_target()?;
         let msvc = target.contains("msvc");
         let (mut cmd, name) = if msvc && is_asm {
@@ -963,7 +1001,7 @@ impl Build {
         if !self.explicit_flags && !(msvc && is_asm && is_arm) {
             cmd.arg(if msvc { "/c" } else { "-c" });
         }
-        cmd.arg(&obj.src);
+        cmd.arg(obj.source());
 
         run(&mut cmd, &name)?;
         Ok(())
@@ -1338,6 +1376,7 @@ impl Build {
         let _ = fs::remove_file(&dst);
 
         let objects: Vec<_> = objs.iter().map(|obj| obj.dst.clone()).collect();
+        let opaque_objects: Vec<_> = self.objects.iter().map(|obj| obj.dst.clone()).collect();
         let target = self.get_target()?;
         if target.contains("msvc") {
             let mut cmd = match self.archiver {
@@ -1353,7 +1392,7 @@ impl Build {
             let mut out = OsString::from("/OUT:");
             out.push(dst);
             run(
-                cmd.arg(out).arg("/nologo").args(&objects).args(&self.objects),
+                cmd.arg(out).arg("/nologo").args(&objects).args(&opaque_objects),
                 "lib.exe",
             )?;
 
@@ -1377,7 +1416,7 @@ impl Build {
         } else {
             let (mut ar, cmd) = self.get_ar()?;
             run(
-                ar.arg("crs").arg(dst).args(&objects).args(&self.objects),
+                ar.arg("crs").arg(dst).args(&objects).args(&opaque_objects),
                 &cmd,
             )?;
         }
