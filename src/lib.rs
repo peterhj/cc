@@ -134,6 +134,7 @@ pub struct Build {
     apple_sdk_root_cache: Arc<Mutex<HashMap<String, OsString>>>,
     emit_rerun_if_env_changed: bool,
     object_prefix_hash: bool,
+    silent: bool,
 }
 
 /// Represents the types of errors that may occur while using cc-rs.
@@ -342,6 +343,7 @@ impl Build {
             apple_sdk_root_cache: Arc::new(Mutex::new(HashMap::new())),
             emit_rerun_if_env_changed: true,
             object_prefix_hash: true,
+            silent: false,
         }
     }
 
@@ -1016,6 +1018,14 @@ impl Build {
         self
     }
 
+    /// Configures whether to silence all printing to stdout.
+    ///
+    /// This option defaults to `false`.
+    pub fn silent(&mut self, silent: bool) -> &mut Build {
+        self.silent = silent;
+        self
+    }
+
     /// Emit and statically link a static archive.
     ///
     /// This option defaults to `true`.
@@ -1211,10 +1221,10 @@ impl Build {
                     }
                 }
                 if libtst && libdir.is_dir() {
-                    println!(
+                    self.print(&format!(
                         "cargo:rustc-link-search=native={}",
                         libdir.to_str().unwrap()
-                    );
+                    ));
                 }
 
                 // And now the -l flag.
@@ -1223,7 +1233,7 @@ impl Build {
                     "static" => "cudart_static",
                     bad => panic!("unsupported cudart option: {}", bad),
                 };
-                println!("cargo:rustc-link-lib={}", lib);
+                self.print(&format!("cargo:rustc-link-lib={}", lib));
             }
         }
 
@@ -1481,7 +1491,7 @@ impl Build {
             self.fix_env_for_apple_os(&mut cmd)?;
         }
 
-        run(&mut cmd, &name)?;
+        run(&mut cmd, &name, self.silent)?;
         Ok(())
     }
 
@@ -1508,7 +1518,7 @@ impl Build {
             .to_string_lossy()
             .into_owned();
 
-        Ok(run_output(&mut cmd, &name)?)
+        Ok(run_output(&mut cmd, &name, self.silent)?)
     }
 
     /// Run the compiler, returning the macro-expanded version of the input files.
@@ -1571,7 +1581,7 @@ impl Build {
         if !no_defaults {
             self.add_default_flags(&mut cmd, &target, &opt_level)?;
         } else {
-            println!("Info: default compiler flags are disabled");
+            if !self.silent { println!("Info: default compiler flags are disabled"); }
         }
 
         for arg in envflags {
@@ -1661,9 +1671,9 @@ impl Build {
 
                 match &opt_level[..] {
                     // Msvc uses /O1 to enable all optimizations that minimize code size.
-                    "z" | "s" | "1" => cmd.push_opt_unless_duplicate("-O1".into()),
+                    "z" | "s" | "1" => cmd.push_opt_unless_duplicate("-O1".into(), self.silent),
                     // -O3 is a valid value for gcc and clang compilers, but not msvc. Cap to /O2.
-                    "2" | "3" => cmd.push_opt_unless_duplicate("-O2".into()),
+                    "2" | "3" => cmd.push_opt_unless_duplicate("-O2".into(), self.silent),
                     _ => {}
                 }
             }
@@ -1671,9 +1681,9 @@ impl Build {
                 // arm-linux-androideabi-gcc 4.8 shipped with Android NDK does
                 // not support '-Oz'
                 if opt_level == "z" && cmd.family != ToolFamily::Clang {
-                    cmd.push_opt_unless_duplicate("-Os".into());
+                    cmd.push_opt_unless_duplicate("-Os".into(), self.silent);
                 } else {
-                    cmd.push_opt_unless_duplicate(format!("-O{}", opt_level).into());
+                    cmd.push_opt_unless_duplicate(format!("-O{}", opt_level).into(), self.silent);
                 }
 
                 if cmd.family == ToolFamily::Clang && target.contains("android") {
@@ -1682,7 +1692,7 @@ impl Build {
                     // this macros is defined.
                     // See https://android.googlesource.com/platform/ndk/+/refs/heads/ndk-release-r21/build/cmake/android.toolchain.cmake#456
                     // https://android.googlesource.com/platform/ndk/+/refs/heads/ndk-release-r21/build/core/build-binary.mk#141
-                    cmd.push_opt_unless_duplicate("-DANDROID".into());
+                    cmd.push_opt_unless_duplicate("-DANDROID".into(), self.silent);
                 }
 
                 if !target.contains("apple-ios") && !target.contains("apple-watchos") {
@@ -2068,11 +2078,11 @@ impl Build {
                     cmd.push_cc_arg(format!("-stdlib=lib{}", stdlib).into());
                 }
                 _ => {
-                    println!(
+                    if !self.silent { println!(
                         "cargo:warning=cpp_set_stdlib is specified, but the {:?} compiler \
                          does not support this option, ignored",
                         cmd.family
-                    );
+                    ); }
                 }
             }
         }
@@ -2111,7 +2121,7 @@ impl Build {
                 cmd.arg("-g");
             }
 
-            println!("cargo:warning=The MSVC ARM assemblers do not support -D flags");
+            if !self.silent { println!("cargo:warning=The MSVC ARM assemblers do not support -D flags"); }
         } else {
             if self.get_debug() {
                 cmd.arg("-Zi");
@@ -2163,7 +2173,7 @@ impl Build {
             cmd.arg(&obj.dst);
         }
 
-        run(&mut cmd, &name)?;
+        run(&mut cmd, &name, self.silent)?;
         Ok(())
     }
 
@@ -2195,7 +2205,7 @@ impl Build {
                 .arg("-o")
                 .arg(dlink.clone())
                 .arg(dst);
-            run(&mut nvcc, "nvcc")?;
+            run(&mut nvcc, "nvcc", self.silent)?;
             self.emit_archive_progressive(dst, &[dlink])?;
         }
 
@@ -2228,7 +2238,7 @@ impl Build {
             // NOTE: We add `s` even if flags were passed using $ARFLAGS/ar_flag, because `s`
             // here represents a _mode_, not an arbitrary flag. Further discussion of this choice
             // can be seen in https://github.com/rust-lang/cc-rs/pull/763.
-            run(ar.arg("s").arg(dst), &cmd)?;
+            run(ar.arg("s").arg(dst), &cmd, self.silent)?;
         }
 
         Ok(())
@@ -2255,7 +2265,7 @@ impl Build {
                 cmd.arg(dst);
             }
             cmd.args(objs);
-            run(&mut cmd, &program)?;
+            run(&mut cmd, &program, self.silent)?;
         } else {
             let (mut ar, cmd, _any_flags) = self.get_ar()?;
 
@@ -2286,7 +2296,7 @@ impl Build {
             // NOTE: We add cq here regardless of whether $ARFLAGS/ar_flag have been used because
             // it dictates the _mode_ ar runs in, which the setter of $ARFLAGS/ar_flag can't
             // dictate. See https://github.com/rust-lang/cc-rs/pull/763 for further discussion.
-            run(ar.arg("cq").arg(dst).args(objs), &cmd)?;
+            run(ar.arg("cq").arg(dst).args(objs), &cmd, self.silent)?;
         }
 
         Ok(())
@@ -2900,7 +2910,7 @@ impl Build {
                     let compiler = self.get_base_compiler().ok()?;
                     if compiler.family == ToolFamily::Clang {
                         name = format!("llvm-{}", tool);
-                        search_programs(&mut self.cmd(&compiler.path), &name)
+                        search_programs(&mut self.cmd(&compiler.path), &name, self.silent)
                             .map(|name| self.cmd(&name))
                     } else {
                         None
@@ -3255,7 +3265,7 @@ impl Build {
     }
 
     fn print(&self, s: &str) {
-        if self.cargo_metadata {
+        if self.cargo_metadata && !self.silent {
             println!("{}", s);
         }
     }
@@ -3300,6 +3310,7 @@ impl Build {
                 .arg("--sdk")
                 .arg(sdk),
             "xcrun",
+            self.silent,
         )?;
 
         let sdk_path = match String::from_utf8(sdk_path) {
@@ -3434,9 +3445,9 @@ impl Tool {
     }
 
     /// Don't push optimization arg if it conflicts with existing args.
-    fn push_opt_unless_duplicate(&mut self, flag: OsString) {
+    fn push_opt_unless_duplicate(&mut self, flag: OsString, silent: bool) {
         if self.is_duplicate_opt_arg(&flag) {
-            println!("Info: Ignoring duplicate arg {:?}", &flag);
+            if !silent { println!("Info: Ignoring duplicate arg {:?}", &flag); }
         } else {
             self.push_cc_arg(flag);
         }
@@ -3546,8 +3557,8 @@ impl Tool {
     }
 }
 
-fn run(cmd: &mut Command, program: &str) -> Result<(), Error> {
-    let (mut child, print) = spawn(cmd, program)?;
+fn run(cmd: &mut Command, program: &str, silent: bool) -> Result<(), Error> {
+    let (mut child, print) = spawn(cmd, program, silent)?;
     let status = match child.wait() {
         Ok(s) => s,
         Err(_) => {
@@ -3561,7 +3572,7 @@ fn run(cmd: &mut Command, program: &str) -> Result<(), Error> {
         }
     };
     print.join().unwrap();
-    println!("{}", status);
+    if !silent { println!("{}", status); }
 
     if status.success() {
         Ok(())
@@ -3576,9 +3587,9 @@ fn run(cmd: &mut Command, program: &str) -> Result<(), Error> {
     }
 }
 
-fn run_output(cmd: &mut Command, program: &str) -> Result<Vec<u8>, Error> {
+fn run_output(cmd: &mut Command, program: &str, silent: bool) -> Result<Vec<u8>, Error> {
     cmd.stdout(Stdio::piped());
-    let (mut child, print) = spawn(cmd, program)?;
+    let (mut child, print) = spawn(cmd, program, silent)?;
     let mut stdout = vec![];
     child
         .stdout
@@ -3599,7 +3610,7 @@ fn run_output(cmd: &mut Command, program: &str) -> Result<Vec<u8>, Error> {
         }
     };
     print.join().unwrap();
-    println!("{}", status);
+    if !silent { println!("{}", status); }
 
     if status.success() {
         Ok(stdout)
@@ -3614,8 +3625,8 @@ fn run_output(cmd: &mut Command, program: &str) -> Result<Vec<u8>, Error> {
     }
 }
 
-fn spawn(cmd: &mut Command, program: &str) -> Result<(Child, JoinHandle<()>), Error> {
-    println!("running: {:?}", cmd);
+fn spawn(cmd: &mut Command, program: &str, silent: bool) -> Result<(Child, JoinHandle<()>), Error> {
+    if !silent { println!("running: {:?}", cmd); }
 
     // Capture the standard error coming from these programs, and write it out
     // with cargo:warning= prefixes. Note that this is a bit wonky to avoid
@@ -3626,9 +3637,13 @@ fn spawn(cmd: &mut Command, program: &str) -> Result<(Child, JoinHandle<()>), Er
             let stderr = BufReader::new(child.stderr.take().unwrap());
             let print = thread::spawn(move || {
                 for line in stderr.split(b'\n').filter_map(|l| l.ok()) {
-                    print!("cargo:warning=");
-                    std::io::stdout().write_all(&line).unwrap();
-                    println!("");
+                    if !silent {
+                        print!("cargo:warning=");
+                        std::io::stdout().write_all(&line).unwrap();
+                        println!("");
+                    } else {
+                        drop(line);
+                    }
                 }
             });
             Ok((child, print))
@@ -3813,8 +3828,8 @@ fn which(tool: &Path, path_entries: Option<OsString>) -> Option<PathBuf> {
 }
 
 // search for |prog| on 'programs' path in '|cc| -print-search-dirs' output
-fn search_programs(cc: &mut Command, prog: &str) -> Option<PathBuf> {
-    let search_dirs = run_output(cc.arg("-print-search-dirs"), "cc").ok()?;
+fn search_programs(cc: &mut Command, prog: &str, silent: bool) -> Option<PathBuf> {
+    let search_dirs = run_output(cc.arg("-print-search-dirs"), "cc", silent).ok()?;
     // clang driver appears to be forcing UTF-8 output even on Windows,
     // hence from_utf8 is assumed to be usable in all cases.
     let search_dirs = std::str::from_utf8(&search_dirs).ok()?;
