@@ -117,6 +117,9 @@ pub struct Build {
     compiler: Option<Arc<Path>>,
     archiver: Option<Arc<Path>>,
     ranlib: Option<Arc<Path>>,
+    //linker: Option<Arc<Path>>,
+    archive: Option<bool>,
+    dylib: Option<bool>,
     cargo_metadata: bool,
     link_lib_modifiers: Vec<Arc<str>>,
     pic: Option<bool>,
@@ -130,6 +133,7 @@ pub struct Build {
     env_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
     apple_sdk_root_cache: Arc<Mutex<HashMap<String, OsString>>>,
     emit_rerun_if_env_changed: bool,
+    object_prefix_hash: bool,
 }
 
 /// Represents the types of errors that may occur while using cc-rs.
@@ -323,6 +327,9 @@ impl Build {
             compiler: None,
             archiver: None,
             ranlib: None,
+            //linker: None,
+            archive: None,
+            dylib: None,
             cargo_metadata: true,
             link_lib_modifiers: Vec::new(),
             pic: None,
@@ -334,6 +341,7 @@ impl Build {
             env_cache: Arc::new(Mutex::new(HashMap::new())),
             apple_sdk_root_cache: Arc::new(Mutex::new(HashMap::new())),
             emit_rerun_if_env_changed: true,
+            object_prefix_hash: true,
         }
     }
 
@@ -999,6 +1007,31 @@ impl Build {
         self
     }
 
+    /// Configures whether object filenames may be prefixed with the hash of their
+    /// directory path.
+    ///
+    /// This option defaults to `true`.
+    pub fn object_prefix_hash(&mut self, object_prefix_hash: bool) -> &mut Build {
+        self.object_prefix_hash = object_prefix_hash;
+        self
+    }
+
+    /// Emit and statically link a static archive.
+    ///
+    /// This option defaults to `true`.
+    pub fn archive(&mut self, archive: bool) -> &mut Build {
+        self.archive = Some(archive);
+        self
+    }
+
+    /// Emit a shared or dynamic library.
+    ///
+    /// This option defaults to `false`.
+    pub fn dylib(&mut self, dylib: bool) -> &mut Build {
+        self.dylib = Some(dylib);
+        self
+    }
+
     #[doc(hidden)]
     pub fn __set_env<A, B>(&mut self, a: A, b: B) -> &mut Build
     where
@@ -1013,6 +1046,10 @@ impl Build {
     ///
     /// This will return a result instead of panicing; see compile() for the complete description.
     pub fn try_compile(&self, output: &str) -> Result<(), Error> {
+        if !(self.archive.unwrap_or(true) || self.dylib.unwrap_or(false)) {
+            return Ok(());
+        }
+
         let mut output_components = Path::new(output).components();
         match (output_components.next(), output_components.next()) {
             (Some(Component::Normal(_)), None) => {}
@@ -1024,35 +1061,30 @@ impl Build {
             }
         }
 
-        let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".a") {
-            (&output[3..output.len() - 2], output.to_owned())
-        } else {
-            let mut gnu = String::with_capacity(5 + output.len());
-            gnu.push_str("lib");
-            gnu.push_str(&output);
-            gnu.push_str(".a");
-            (output, gnu)
-        };
         let dst = self.get_out_dir()?;
 
         let mut objects = Vec::new();
         for file in self.files.iter() {
             let obj = if file.has_root() || file.components().any(|x| x == Component::ParentDir) {
                 // If `file` is an absolute path or might not be usable directly as a suffix due to
-                // using "..", use the `basename` prefixed with the `dirname`'s hash to ensure name
-                // uniqueness.
+                // using "..".
                 let basename = file
                     .file_name()
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "file_name() failure"))?
-                    .to_string_lossy();
-                let dirname = file
-                    .parent()
-                    .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "parent() failure"))?
-                    .to_string_lossy();
-                let mut hasher = hash_map::DefaultHasher::new();
-                hasher.write(dirname.to_string().as_bytes());
-                dst.join(format!("{:016x}-{}", hasher.finish(), basename))
-                    .with_extension("o")
+                    .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "file_name() failure"))?;
+                if self.object_prefix_hash {
+                    // Use the `basename` prefixed with the `dirname`'s hash to ensure name
+                    // uniqueness.
+                    let dirname = file
+                        .parent()
+                        .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "parent() failure"))?
+                        .to_string_lossy();
+                    let mut hasher = hash_map::DefaultHasher::new();
+                    hasher.write(dirname.to_string().as_bytes());
+                    dst.join(format!("{:016x}-{}", hasher.finish(), basename.to_string_lossy()))
+                        .with_extension("o")
+                } else {
+                    dst.join(basename).with_extension("o")
+                }
             } else {
                 dst.join(file).with_extension("o")
             };
@@ -1077,8 +1109,38 @@ impl Build {
             objects.push(Object::new(file.to_path_buf(), obj));
         }
         self.compile_objects(&objects)?;
-        self.assemble(lib_name, &dst.join(gnu_lib_name), &objects)?;
 
+        if self.dylib.unwrap_or(false) {
+            let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".so") {
+                (&output[3..output.len() - 3], output.to_owned())
+            } else {
+                let mut gnu = String::with_capacity(6 + output.len());
+                gnu.push_str("lib");
+                gnu.push_str(&output);
+                gnu.push_str(".so");
+                (output, gnu)
+            };
+            self.emit_dylib(lib_name, &dst.join(gnu_lib_name), &objects)?;
+        }
+
+        if self.archive.unwrap_or(true) {
+            let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".a") {
+                (&output[3..output.len() - 2], output.to_owned())
+            } else {
+                let mut gnu = String::with_capacity(5 + output.len());
+                gnu.push_str("lib");
+                gnu.push_str(&output);
+                gnu.push_str(".a");
+                (output, gnu)
+            };
+            self.emit_archive(lib_name, &dst.join(gnu_lib_name), &objects)?;
+            self.link_archive(lib_name, &dst)?;
+        }
+
+        Ok(())
+    }
+
+    fn link_archive(&self, lib_name: &str, dst: &Path) -> Result<(), Error> {
         if self.get_target()?.contains("msvc") {
             let compiler = self.get_base_compiler()?;
             let atlmfc_lib = compiler
@@ -2074,7 +2136,38 @@ impl Build {
         Ok((cmd, tool.to_string()))
     }
 
-    fn assemble(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
+    fn emit_dylib(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
+        // FIXME FIXME: this is very gcc-specific, assuming the compiler is also the linker.
+        let compiler = self.try_get_compiler()?;
+
+        let (mut cmd, name) = {
+            let mut cmd = compiler.to_command();
+            for &(ref a, ref b) in self.env.iter() {
+                cmd.env(a, b);
+            }
+            (
+                cmd,
+                compiler
+                    .path
+                    .file_name()
+                    .ok_or_else(|| Error::new(ErrorKind::IOError, "Failed to get compiler path."))?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        cmd.arg("-shared");
+        cmd.arg(&format!("-Wl,-soname,lib{}.so.0", lib_name));
+        cmd.arg("-o");
+        cmd.arg(dst);
+        for obj in objs.iter() {
+            cmd.arg(&obj.dst);
+        }
+
+        run(&mut cmd, &name)?;
+        Ok(())
+    }
+
+    fn emit_archive(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
         // Delete the destination if it exists as we want to
         // create on the first iteration instead of appending.
         let _ = fs::remove_file(&dst);
@@ -2088,7 +2181,7 @@ impl Build {
             .chain(self.objects.iter().map(|path| (**path).to_owned()))
             .collect();
         for chunk in objs.chunks(100) {
-            self.assemble_progressive(dst, chunk)?;
+            self.emit_archive_progressive(dst, chunk)?;
         }
 
         if self.cuda && self.cuda_file_count() > 0 {
@@ -2103,7 +2196,7 @@ impl Build {
                 .arg(dlink.clone())
                 .arg(dst);
             run(&mut nvcc, "nvcc")?;
-            self.assemble_progressive(dst, &[dlink])?;
+            self.emit_archive_progressive(dst, &[dlink])?;
         }
 
         let target = self.get_target()?;
@@ -2141,7 +2234,7 @@ impl Build {
         Ok(())
     }
 
-    fn assemble_progressive(&self, dst: &Path, objs: &[PathBuf]) -> Result<(), Error> {
+    fn emit_archive_progressive(&self, dst: &Path, objs: &[PathBuf]) -> Result<(), Error> {
         let target = self.get_target()?;
 
         if target.contains("msvc") {
