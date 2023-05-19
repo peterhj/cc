@@ -57,6 +57,7 @@
 #![deny(missing_docs)]
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{hash_map, HashMap};
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -66,7 +67,7 @@ use std::hash::Hasher;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 use std::thread::{self, JoinHandle};
 
 // These modules are all glue to support reading the MSVC version from
@@ -92,36 +93,36 @@ pub mod windows_registry;
 /// documentation on each method itself.
 #[derive(Clone, Debug)]
 pub struct Build {
-    include_directories: Vec<Arc<Path>>,
-    definitions: Vec<(Arc<str>, Option<Arc<str>>)>,
-    objects: Vec<Arc<Path>>,
-    flags: Vec<Arc<str>>,
-    flags_supported: Vec<Arc<str>>,
-    known_flag_support_status: Arc<Mutex<HashMap<String, bool>>>,
-    ar_flags: Vec<Arc<str>>,
-    asm_flags: Vec<Arc<str>>,
+    include_directories: Vec<Rc<Path>>,
+    definitions: Vec<(Rc<str>, Option<Rc<str>>)>,
+    objects: Vec<Rc<Path>>,
+    flags: Vec<Rc<str>>,
+    flags_supported: Vec<Rc<str>>,
+    known_flag_support_status: Rc<RefCell<HashMap<String, bool>>>,
+    ar_flags: Vec<Rc<str>>,
+    asm_flags: Vec<Rc<str>>,
     no_default_flags: bool,
-    files: Vec<Arc<Path>>,
+    files: Vec<Rc<Path>>,
     cpp: bool,
-    cpp_link_stdlib: Option<Option<Arc<str>>>,
-    cpp_set_stdlib: Option<Arc<str>>,
+    cpp_link_stdlib: Option<Option<Rc<str>>>,
+    cpp_set_stdlib: Option<Rc<str>>,
     cuda: bool,
-    cudart: Option<Arc<str>>,
-    target: Option<Arc<str>>,
-    host: Option<Arc<str>>,
-    out_dir: Option<Arc<Path>>,
-    opt_level: Option<Arc<str>>,
+    cudart: Option<Rc<str>>,
+    target: Option<Rc<str>>,
+    host: Option<Rc<str>>,
+    out_dir: Option<Rc<Path>>,
+    opt_level: Option<Rc<str>>,
     debug: Option<bool>,
     force_frame_pointer: Option<bool>,
-    env: Vec<(Arc<OsStr>, Arc<OsStr>)>,
-    compiler: Option<Arc<Path>>,
-    archiver: Option<Arc<Path>>,
-    ranlib: Option<Arc<Path>>,
-    //linker: Option<Arc<Path>>,
+    env: Vec<(Rc<OsStr>, Rc<OsStr>)>,
+    compiler: Option<Rc<Path>>,
+    archiver: Option<Rc<Path>>,
+    ranlib: Option<Rc<Path>>,
+    //linker: Option<Rc<Path>>,
     archive: Option<bool>,
     dylib: Option<bool>,
     cargo_metadata: bool,
-    link_lib_modifiers: Vec<Arc<str>>,
+    link_lib_modifiers: Vec<Rc<str>>,
     pic: Option<bool>,
     use_plt: Option<bool>,
     static_crt: Option<bool>,
@@ -130,8 +131,8 @@ pub struct Build {
     warnings_into_errors: bool,
     warnings: Option<bool>,
     extra_warnings: Option<bool>,
-    env_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
-    apple_sdk_root_cache: Arc<Mutex<HashMap<String, OsString>>>,
+    env_cache: Rc<RefCell<HashMap<String, Option<String>>>>,
+    apple_sdk_root_cache: Rc<RefCell<HashMap<String, OsString>>>,
     emit_rerun_if_env_changed: bool,
     object_prefix_hash: bool,
     silent: bool,
@@ -306,7 +307,7 @@ impl Build {
             objects: Vec::new(),
             flags: Vec::new(),
             flags_supported: Vec::new(),
-            known_flag_support_status: Arc::new(Mutex::new(HashMap::new())),
+            known_flag_support_status: Rc::new(RefCell::new(HashMap::new())),
             ar_flags: Vec::new(),
             asm_flags: Vec::new(),
             no_default_flags: false,
@@ -339,8 +340,8 @@ impl Build {
             warnings: None,
             extra_warnings: None,
             warnings_into_errors: false,
-            env_cache: Arc::new(Mutex::new(HashMap::new())),
-            apple_sdk_root_cache: Arc::new(Mutex::new(HashMap::new())),
+            env_cache: Rc::new(RefCell::new(HashMap::new())),
+            apple_sdk_root_cache: Rc::new(RefCell::new(HashMap::new())),
             emit_rerun_if_env_changed: true,
             object_prefix_hash: true,
             silent: false,
@@ -500,7 +501,7 @@ impl Build {
     /// `known_flag_support` field. If `is_flag_supported(flag)`
     /// is called again, the result will be read from the hash table.
     pub fn is_flag_supported(&self, flag: &str) -> Result<bool, Error> {
-        let mut known_status = self.known_flag_support_status.lock().unwrap();
+        let mut known_status = self.known_flag_support_status.borrow_mut();
         if let Some(is_supported) = known_status.get(flag).cloned() {
             return Ok(is_supported);
         }
@@ -3241,7 +3242,7 @@ impl Build {
                 _ => false,
             }
         }
-        let mut cache = self.env_cache.lock().unwrap();
+        let mut cache = self.env_cache.borrow_mut();
         if let Some(val) = cache.get(v) {
             return val.clone();
         }
@@ -3296,10 +3297,7 @@ impl Build {
     }
 
     fn apple_sdk_root(&self, sdk: &str) -> Result<OsString, Error> {
-        let mut cache = self
-            .apple_sdk_root_cache
-            .lock()
-            .expect("apple_sdk_root_cache lock failed");
+        let mut cache = self.apple_sdk_root_cache.borrow_mut();
         if let Some(ret) = cache.get(sdk) {
             return Ok(ret.clone());
         }
