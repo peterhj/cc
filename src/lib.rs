@@ -282,9 +282,11 @@ impl ToolFamily {
 ///
 /// This is a source file -> object file pair.
 #[derive(Clone, Debug)]
-struct Object {
-    src: PathBuf,
-    dst: PathBuf,
+pub struct Object {
+    /// The path to the source file.
+    pub src: PathBuf,
+    /// The path to the compiled object file.
+    pub dst: PathBuf,
 }
 
 impl Object {
@@ -1056,19 +1058,24 @@ impl Build {
     /// Run the compiler, generating the file `output`
     ///
     /// This will return a result instead of panicing; see compile() for the complete description.
-    pub fn try_compile(&self, output: &str) -> Result<(), Error> {
-        if !(self.archive.unwrap_or(true) || self.dylib.unwrap_or(false)) {
+    pub fn try_compile<'o, O: Into<Option<&'o str>>>(&self, output: O) -> Result<Vec<Object>, Error> {
+    //pub fn try_compile<'o, O: Into<Option<S>>, S: AsRef<str>>(&self, output: O) -> Result<Vec<Object>, Error> {}
+        /*if !(self.archive.unwrap_or(true) || self.dylib.unwrap_or(false)) {
             return Ok(());
-        }
+        }*/
 
-        let mut output_components = Path::new(output).components();
-        match (output_components.next(), output_components.next()) {
-            (Some(Component::Normal(_)), None) => {}
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidArgument,
-                    "argument of `compile` must be a single normal path component",
-                ));
+        let output = output.into();
+        //let output = output.as_ref().map(|s| s.as_ref());
+        if let Some(output) = output {
+            let mut output_components = Path::new(output).components();
+            match (output_components.next(), output_components.next()) {
+                (Some(Component::Normal(_)), None) => {}
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidArgument,
+                        "argument of `compile` must be a single normal path component",
+                    ));
+                }
             }
         }
 
@@ -1122,19 +1129,40 @@ impl Build {
         self.compile_objects(&objects)?;
 
         if self.dylib.unwrap_or(false) {
-            let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".so") {
-                (&output[3..output.len() - 3], output.to_owned())
+            let output = output.unwrap();
+            let target = self.get_target()?;
+            if target.contains("linux")
+            || target.contains("freebsd")
+            || target.contains("netbsd")
+            || target.contains("openbsd") {
+                let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".so") {
+                    (&output[3..output.len() - 3], output.to_owned())
+                } else {
+                    let mut gnu = String::with_capacity(6 + output.len());
+                    gnu.push_str("lib");
+                    gnu.push_str(&output);
+                    gnu.push_str(".so");
+                    (output, gnu)
+                };
+                self.emit_dylib(lib_name, &dst.join(gnu_lib_name), &objects)?;
+            } else if target.contains("darwin") {
+                let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".dylib") {
+                    (&output[3..output.len() - 6], output.to_owned())
+                } else {
+                    let mut gnu = String::with_capacity(9 + output.len());
+                    gnu.push_str("lib");
+                    gnu.push_str(&output);
+                    gnu.push_str(".dylib");
+                    (output, gnu)
+                };
+                self.emit_dylib(lib_name, &dst.join(gnu_lib_name), &objects)?;
             } else {
-                let mut gnu = String::with_capacity(6 + output.len());
-                gnu.push_str("lib");
-                gnu.push_str(&output);
-                gnu.push_str(".so");
-                (output, gnu)
-            };
-            self.emit_dylib(lib_name, &dst.join(gnu_lib_name), &objects)?;
+                unimplemented!();
+            }
         }
 
         if self.archive.unwrap_or(true) {
+            let output = output.unwrap();
             let (lib_name, gnu_lib_name) = if output.starts_with("lib") && output.ends_with(".a") {
                 (&output[3..output.len() - 2], output.to_owned())
             } else {
@@ -1148,7 +1176,7 @@ impl Build {
             self.link_archive(lib_name, &dst)?;
         }
 
-        Ok(())
+        Ok(objects)
     }
 
     fn link_archive(&self, lib_name: &str, dst: &Path) -> Result<(), Error> {
@@ -2148,9 +2176,10 @@ impl Build {
     }
 
     fn emit_dylib(&self, lib_name: &str, dst: &Path, objs: &[Object]) -> Result<(), Error> {
+        let target = self.get_target()?;
+
         // FIXME FIXME: this is very gcc-specific, assuming the compiler is also the linker.
         let compiler = self.try_get_compiler()?;
-
         let (mut cmd, name) = {
             let mut cmd = compiler.to_command();
             for &(ref a, ref b) in self.env.iter() {
@@ -2166,12 +2195,26 @@ impl Build {
                     .into_owned(),
             )
         };
-        cmd.arg("-shared");
-        cmd.arg(&format!("-Wl,-soname,lib{}.so.0", lib_name));
-        cmd.arg("-o");
-        cmd.arg(dst);
-        for obj in objs.iter() {
-            cmd.arg(&obj.dst);
+        if target.contains("linux")
+        || target.contains("freebsd")
+        || target.contains("netbsd")
+        || target.contains("openbsd") {
+            cmd.arg("-shared");
+            cmd.arg(&format!("-Wl,-soname,lib{}.so.0", lib_name));
+            cmd.arg("-o");
+            cmd.arg(dst);
+            for obj in objs.iter() {
+                cmd.arg(&obj.dst);
+            }
+        } else if target.contains("darwin") {
+            cmd.arg("-dynamiclib");
+            cmd.arg("-o");
+            cmd.arg(dst);
+            for obj in objs.iter() {
+                cmd.arg(&obj.dst);
+            }
+        } else {
+            unimplemented!();
         }
 
         run(&mut cmd, &name, self.silent)?;
@@ -3164,7 +3207,8 @@ impl Build {
             prefixes.first().map(|prefix| *prefix))
     }
 
-    fn get_target(&self) -> Result<Cow<str>, Error> {
+    /// TARGET.
+    pub fn get_target(&self) -> Result<Cow<str>, Error> {
         match &self.target {
             Some(t) => Ok(Cow::Borrowed(&t)),
             None => Ok(Cow::Owned(self.getenv_unwrap("TARGET")?)),
@@ -3215,7 +3259,8 @@ impl Build {
         self.force_frame_pointer.unwrap_or_else(|| self.get_debug())
     }
 
-    fn get_out_dir(&self) -> Result<PathBuf, Error> {
+    /// OUT_DIR.
+    pub fn get_out_dir(&self) -> Result<PathBuf, Error> {
         match &self.out_dir {
             Some(p) => Ok((**p).into()),
             None => Ok(env::var_os("OUT_DIR").map(PathBuf::from).ok_or_else(|| {
